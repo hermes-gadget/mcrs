@@ -16,8 +16,11 @@ const ANON_REQ_TYPE_REGIONS: u8 = 0x01;
 const ANON_REQ_TYPE_OWNER: u8 = 0x02;
 const ANON_REQ_TYPE_BASIC: u8 = 0x03;
 const REQ_TYPE_GET_STATUS: u8 = 0x01;
+const REQ_TYPE_GET_TELEMETRY_DATA: u8 = 0x03;
 const REQ_TYPE_GET_NEIGHBOURS: u8 = 0x06;
 const REQ_TYPE_GET_OWNER_INFO: u8 = 0x07;
+const LPP_CHANNEL_SELF: u8 = 1;
+const LPP_TYPE_VOLTAGE: u8 = 116;
 const REPEATER_STATS_LEN: usize = 56;
 const FIRMWARE_VERSION: &str = env!("MESHCORE_FIRMWARE_VERSION");
 
@@ -135,22 +138,41 @@ pub async fn handle_remote_packet<Store>(
 where
     Store: crate::platform::storage::Storage,
 {
-    if !packet.route_type.is_direct()
-        || !packet_targets_this_node(packet, &context.node_hash().await)
-    {
-        return None;
+    if let Payload::AnonymousRequest(payload) = &packet.payload {
+        let reply_path = if packet.route_type.is_flood() {
+            packet.normal_path()?.reversed()
+        } else if packet.route_type.is_direct()
+            && packet_targets_this_node(packet, &context.node_hash().await)
+        {
+            mcrs_protocol::Path::empty()
+        } else {
+            return None;
+        };
+        return handle_anonymous_request(payload, reply_path, context).await;
     }
 
     match &packet.payload {
-        Payload::AnonymousRequest(payload) => handle_anonymous_request(payload, context).await,
-        Payload::Request(payload) => handle_authenticated_request(payload, context).await,
-        Payload::TextMessage(payload) => handle_authenticated_text_message(payload, context).await,
+        Payload::Request(payload)
+            if packet.route_type.is_flood()
+                || (packet.route_type.is_direct()
+                    && packet_targets_this_node(packet, &context.node_hash().await)) =>
+        {
+            handle_authenticated_request(packet, payload, context).await
+        }
+        Payload::TextMessage(payload)
+            if packet.route_type.is_flood()
+                || (packet.route_type.is_direct()
+                    && packet_targets_this_node(packet, &context.node_hash().await)) =>
+        {
+            handle_authenticated_text_message(payload, context).await
+        }
         _ => None,
     }
 }
 
 async fn handle_anonymous_request(
     payload: &mcrs_protocol::AnonymousRequestPayload,
+    reply_path: mcrs_protocol::Path,
     context: &AppContext<impl crate::platform::storage::Storage>,
 ) -> Option<alloc::vec::Vec<u8>> {
     let (decrypted, responder_public_key) = context
@@ -164,11 +186,12 @@ async fn handle_anonymous_request(
     let body = plaintext_body(&decrypted.plaintext)?;
 
     if let Some(response) = handle_anonymous_subrequest(body, timestamp, context).await {
-        return super::crypto::encode_zero_hop_response_plaintext(
+        return super::crypto::encode_response_plaintext(
             &decrypted.shared_secret,
             &decrypted.sender_pubkey,
             &responder_public_key,
             &response,
+            reply_path,
         );
     }
 
@@ -189,6 +212,7 @@ async fn handle_anonymous_request(
                 privilege,
                 timestamp,
                 now_ms,
+                &reply_path,
             )
             .await;
         let mut sender = String::new();
@@ -198,11 +222,12 @@ async fn handle_anonymous_request(
             remote_privilege_name(privilege),
             sender
         ));
-        return super::crypto::encode_zero_hop_login_response(
+        return super::crypto::encode_login_response(
             &decrypted.shared_secret,
             &decrypted.sender_pubkey,
             &responder_public_key,
             acl_permissions_for(privilege),
+            reply_path,
         );
     }
 
@@ -226,6 +251,7 @@ async fn handle_anonymous_request(
         &responder_public_key,
         timestamp,
         response.text,
+        reply_path,
     )
 }
 
@@ -262,6 +288,7 @@ async fn handle_authenticated_text_message(
     }
 
     let command = core::str::from_utf8(&plaintext.message).ok()?.trim();
+    let (correlation_prefix, command) = split_cli_correlation_prefix(command);
     if command.is_empty() {
         return None;
     }
@@ -270,9 +297,12 @@ async fn handle_authenticated_text_message(
         cli_privilege_for_remote(Some(decrypted.privilege)),
         plaintext.timestamp,
     );
-    let response = handle_command(command, context, request).await?;
+    let mut response = handle_command(command, context, request).await?;
     if response.post_reply == Some(PostReplyAction::Reboot) {
         context.request_reboot_after_next_remote_reply();
+    }
+    if let Some(prefix) = correlation_prefix {
+        response.text.insert_str(0, prefix);
     }
     encode_remote_cli_reply(
         &decrypted.shared_secret,
@@ -280,13 +310,36 @@ async fn handle_authenticated_text_message(
         &responder_public_key,
         plaintext.timestamp,
         response.text,
+        decrypted.reply_path,
     )
 }
 
+fn split_cli_correlation_prefix(command: &str) -> (Option<&str>, &str) {
+    let bytes = command.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_hexdigit()
+        && bytes[1].is_ascii_hexdigit()
+        && bytes[2] == b'|'
+    {
+        (Some(&command[..3]), command[3..].trim())
+    } else {
+        (None, command)
+    }
+}
+
 async fn handle_authenticated_request(
+    packet: &Packet,
     payload: &mcrs_protocol::DirectEncryptedPayload,
     context: &AppContext<impl crate::platform::storage::Storage>,
 ) -> Option<Vec<u8>> {
+    let flood_region = if packet.route_type.is_flood() {
+        let region = context
+            .with_config(|config| config.regions().match_flood_region(packet))
+            .await?;
+        Some(region)
+    } else {
+        None
+    };
     let now_ms = crate::platform::now_millis();
     let decrypted = decrypt_authenticated_payload(payload, context, now_ms).await?;
     let plaintext = RequestPlaintext::decode(&decrypted.plaintext).ok()?;
@@ -306,11 +359,28 @@ async fn handle_authenticated_request(
 
     let response_body =
         handle_binary_request(&plaintext, context, now_ms, decrypted.privilege).await?;
-    super::crypto::encode_zero_hop_response_plaintext(
+    if let Some(region) = flood_region {
+        let discovered_path = packet.normal_path()?.clone();
+        let mut response = super::crypto::encode_path_response_packet(
+            &decrypted.shared_secret,
+            &decrypted.sender_pubkey,
+            &responder_public_key,
+            &response_body,
+            discovered_path,
+        )?;
+        context
+            .with_config(|config| config.regions().apply_scope(&mut response, &region))
+            .await
+            .ok()?;
+        return response.encode().ok();
+    }
+
+    super::crypto::encode_response_plaintext(
         &decrypted.shared_secret,
         &decrypted.sender_pubkey,
         &responder_public_key,
         &response_body,
+        decrypted.reply_path,
     )
 }
 
@@ -340,6 +410,17 @@ async fn handle_binary_request(
             let mut response = Vec::new();
             response.extend_from_slice(&request.timestamp.to_le_bytes());
             encode_status_binary_response(context.status(), &mut response);
+            Some(response)
+        }
+        REQ_TYPE_GET_TELEMETRY_DATA => {
+            let mut response = Vec::new();
+            response.extend_from_slice(&request.timestamp.to_le_bytes());
+            if let Some(millivolts) = context.status().battery_millivolts {
+                response.push(LPP_CHANNEL_SELF);
+                response.push(LPP_TYPE_VOLTAGE);
+                let centivolts = millivolts.saturating_add(5) / 10;
+                response.extend_from_slice(&centivolts.to_be_bytes());
+            }
             Some(response)
         }
         REQ_TYPE_GET_NEIGHBOURS => {
@@ -1501,14 +1582,16 @@ fn encode_remote_cli_reply(
     responder_public_key: &[u8; 32],
     request_timestamp: u32,
     mut output: String,
+    reply_path: mcrs_protocol::Path,
 ) -> Option<alloc::vec::Vec<u8>> {
     truncate_to_remote_reply_len(&mut output);
-    super::crypto::encode_zero_hop_cli_text_response(
+    super::crypto::encode_cli_text_response(
         shared_secret,
         requester_public_key,
         responder_public_key,
         request_timestamp,
         output.as_bytes(),
+        reply_path,
     )
 }
 
@@ -1725,5 +1808,31 @@ impl CliPrivilege {
             Self::AnonymousRemote => "anonymous",
             Self::PasswordedRemote => "passworded",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_cli_correlation_prefix;
+
+    #[test]
+    fn splits_cli_correlation_prefix() {
+        assert_eq!(
+            split_cli_correlation_prefix("04|region"),
+            (Some("04|"), "region")
+        );
+        assert_eq!(
+            split_cli_correlation_prefix("aF|  get radio  "),
+            (Some("aF|"), "get radio")
+        );
+    }
+
+    #[test]
+    fn leaves_unprefixed_and_non_hex_commands_unchanged() {
+        assert_eq!(split_cli_correlation_prefix("region"), (None, "region"));
+        assert_eq!(
+            split_cli_correlation_prefix("zz|region"),
+            (None, "zz|region")
+        );
     }
 }

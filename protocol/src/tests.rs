@@ -119,6 +119,27 @@ fn advert_payload_rejects_overlong_app_data_instead_of_truncating() {
 }
 
 #[test]
+fn public_payload_decoders_reject_oversized_input() {
+    let input = vec![0; MAX_PACKET_PAYLOAD + 1];
+    let expected = Some(Error::PayloadTooLong { len: input.len() });
+
+    assert_eq!(
+        Payload::decode(PayloadKind::RawCustom, &input).err(),
+        expected
+    );
+    assert_eq!(DirectEncryptedPayload::decode(&input).err(), expected);
+    assert_eq!(AnonymousRequestPayload::decode(&input).err(), expected);
+    assert_eq!(GroupEncryptedPayload::decode(&input).err(), expected);
+    assert_eq!(ControlPayload::decode(&input).err(), expected);
+    assert_eq!(MultipartPayload::decode(&input).err(), expected);
+    assert_eq!(TracePayload::decode(&input).err(), expected);
+    assert_eq!(RequestPlaintext::decode(&input).err(), expected);
+    assert_eq!(RepeaterResponsePlaintext::decode(&input).err(), expected);
+    assert_eq!(TextMessagePlaintext::decode(&input).err(), expected);
+    assert_eq!(PathPlaintext::decode(&input).err(), expected);
+}
+
+#[test]
 fn advert_payload_verifies_signature_over_public_key_timestamp_and_app_data() {
     let signing_key = SigningKey::from_bytes(&[7; SEED_SIZE]);
     let public_key = signing_key.verifying_key().to_bytes();
@@ -224,7 +245,10 @@ fn plaintext_helpers_round_trip() {
         attempt: 2,
         message: b"abcdhello".to_vec(),
     };
-    assert_eq!(TextMessagePlaintext::decode(&text.encode()).unwrap(), text);
+    assert_eq!(
+        TextMessagePlaintext::decode(&text.encode().unwrap()).unwrap(),
+        text
+    );
 
     let reply_path = Path::from_hashes(HashSize::One, &[&[1], &[2], &[3]]).unwrap();
     let req = RepeaterSubRequestPlaintext {
@@ -266,6 +290,13 @@ fn path_detects_hash_using_path_hash_size() {
 }
 
 #[test]
+fn path_reverses_whole_hashes() {
+    let path = Path::from_hashes(HashSize::Two, &[&[1, 2], &[3, 4], &[5, 6]]).unwrap();
+
+    assert_eq!(path.reversed().bytes(), &[5, 6, 3, 4, 1, 2]);
+}
+
+#[test]
 fn dedup_signature_uses_trace_path_length() {
     let mut packet = Packet {
         route_type: RouteType::Direct,
@@ -285,6 +316,51 @@ fn dedup_signature_uses_trace_path_length() {
 }
 
 #[test]
+fn dedup_signature_distinguishes_route_and_transport_scope() {
+    let payload = Payload::RawCustom(vec![1, 2, 3]);
+    let unscoped = Packet {
+        route_type: RouteType::Flood,
+        transport_codes: None,
+        path: RoutePath::Normal(Path::empty()),
+        payload: payload.clone(),
+    };
+    let scoped_a = Packet {
+        route_type: RouteType::TransportFlood,
+        transport_codes: Some(TransportCodes::new(0x1234)),
+        path: RoutePath::Normal(Path::empty()),
+        payload: payload.clone(),
+    };
+    let scoped_other_primary = Packet {
+        route_type: RouteType::TransportFlood,
+        transport_codes: Some(TransportCodes::new(0x5678)),
+        path: RoutePath::Normal(Path::empty()),
+        payload: payload.clone(),
+    };
+    let scoped_other_secondary = Packet {
+        route_type: RouteType::TransportFlood,
+        transport_codes: Some(TransportCodes {
+            primary: 0x1234,
+            secondary: 0x5678,
+        }),
+        path: RoutePath::Normal(Path::empty()),
+        payload,
+    };
+
+    assert_ne!(
+        unscoped.dedup_signature().unwrap(),
+        scoped_a.dedup_signature().unwrap()
+    );
+    assert_ne!(
+        scoped_a.dedup_signature().unwrap(),
+        scoped_other_primary.dedup_signature().unwrap()
+    );
+    assert_eq!(
+        scoped_a.dedup_signature().unwrap(),
+        scoped_other_secondary.dedup_signature().unwrap()
+    );
+}
+
+#[test]
 fn seen_packet_cache_suppresses_until_ttl_expires() {
     let mut cache = SeenPacketCache::new(5);
     let now = 10;
@@ -301,6 +377,41 @@ fn seen_packet_cache_drops_oldest_when_capacity_is_reached() {
     assert!(cache.check_and_insert([3; 8], 3));
     assert!(cache.check_and_insert([1; 8], 4));
     assert!(!cache.check_and_insert([3; 8], 5));
+}
+
+#[test]
+fn seen_packet_cache_touch_restarts_ttl() {
+    let mut cache = SeenPacketCache::new(5);
+    assert!(cache.check_and_insert([1; 8], 10));
+    cache.touch([1; 8], 14);
+
+    assert!(cache.contains([1; 8], 19));
+    assert!(!cache.contains([1; 8], 20));
+}
+
+#[test]
+fn default_seen_packet_cache_is_bounded() {
+    let mut cache = SeenPacketCache::new(u64::MAX);
+    for index in 0..300u16 {
+        let mut signature = [0u8; 8];
+        signature[..2].copy_from_slice(&index.to_le_bytes());
+        cache.touch(signature, 0);
+    }
+
+    assert!(!cache.contains([0; 8], 0));
+    let mut newest = [0u8; 8];
+    newest[..2].copy_from_slice(&299u16.to_le_bytes());
+    assert!(cache.contains(newest, 0));
+}
+
+#[test]
+fn path_from_hashes_rejects_oversized_input_before_allocation() {
+    let hash = [0u8; 2];
+    let hashes = [&hash[..]; 33];
+    assert_eq!(
+        Path::from_hashes(HashSize::Two, &hashes),
+        Err(Error::PathTooLong { len: 66 })
+    );
 }
 
 #[test]
@@ -342,6 +453,85 @@ fn malformed_packets_return_errors_instead_of_panicking() {
 }
 
 #[test]
+fn packet_decoder_rejects_truncated_frames() {
+    // Flood ACK header with no path-length byte.
+    assert_eq!(
+        Packet::decode(&[0x0d]),
+        Err(Error::Truncated("path_length"))
+    );
+
+    // Transport ACK header with neither 16-bit transport code present.
+    assert_eq!(
+        Packet::decode(&[0x0c]),
+        Err(Error::Truncated("transport primary"))
+    );
+
+    // Two complete transport codes, but no path-length byte after them.
+    assert_eq!(
+        Packet::decode(&[0x0c, 0, 0, 0, 0]),
+        Err(Error::Truncated("path_length"))
+    );
+
+    // A normal route declaring one one-byte hash, with no hash byte present.
+    assert_eq!(Packet::decode(&[0x0d, 0x01]), Err(Error::Truncated("path")));
+}
+
+#[test]
+fn packet_decoder_rejects_empty_control_and_trace_payloads() {
+    // Direct CONTROL with a zero-hop path but no control flags byte.
+    assert_eq!(
+        Packet::decode(&[0x2e, 0x00]),
+        Err(Error::Truncated("control payload"))
+    );
+
+    // Direct TRACE with a zero-length SNR path but none of its nine-byte
+    // fixed payload bytes (tag, auth code, and flags).
+    assert_eq!(
+        Packet::decode(&[0x26, 0x00]),
+        Err(Error::Truncated("trace tag"))
+    );
+}
+
+#[test]
+fn path_plaintext_rejects_route_and_extra_type_truncation() {
+    // The embedded path claims 63 one-byte hashes, but the plaintext ends
+    // immediately after the length byte.
+    assert_eq!(
+        PathPlaintext::decode(&[0x3f]),
+        Err(Error::Truncated("path"))
+    );
+
+    // A valid empty embedded path still requires an extra-type byte.
+    assert_eq!(
+        PathPlaintext::decode(&[0x00]),
+        Err(Error::Truncated("path plaintext extra_type"))
+    );
+}
+
+#[test]
+fn direct_ciphertext_requires_nonempty_complete_aes_blocks() {
+    let payload = DirectEncryptedPayload {
+        destination_hash: 1,
+        source_hash: 2,
+        mac: [0; CIPHER_MAC_SIZE],
+        ciphertext: vec![],
+    };
+    assert!(!payload.has_complete_ciphertext_blocks());
+
+    let unaligned = DirectEncryptedPayload {
+        ciphertext: vec![0; CIPHER_BLOCK_SIZE - 1],
+        ..payload.clone()
+    };
+    assert!(!unaligned.has_complete_ciphertext_blocks());
+
+    let aligned = DirectEncryptedPayload {
+        ciphertext: vec![0; CIPHER_BLOCK_SIZE],
+        ..payload
+    };
+    assert!(aligned.has_complete_ciphertext_blocks());
+}
+
+#[test]
 fn public_trace_helper_rejects_invalid_manual_trace_payload() {
     let packet = Packet {
         route_type: RouteType::Direct,
@@ -377,6 +567,25 @@ fn payload_decoders_reject_truncation() {
     assert!(RepeaterSubRequestPlaintext::decode(&[0; 5]).is_err());
     assert!(RepeaterLoginResponsePlaintext::decode(&[0; 12]).is_err());
     assert!(RepeaterResponsePlaintext::decode(&[0; 7]).is_err());
+}
+
+#[test]
+fn text_message_rejects_messages_over_the_protocol_limit() {
+    let text = TextMessagePlaintext {
+        timestamp: 1,
+        text_type: TextType::Plain,
+        attempt: 0,
+        message: vec![0; MAX_TEXT_LEN + 1],
+    };
+
+    assert_eq!(text.encode(), Err(Error::InvalidLength("text message")));
+
+    let mut encoded = vec![0; 5];
+    encoded.extend_from_slice(&text.message);
+    assert_eq!(
+        TextMessagePlaintext::decode(&encoded),
+        Err(Error::InvalidLength("text message"))
+    );
 }
 
 #[test]

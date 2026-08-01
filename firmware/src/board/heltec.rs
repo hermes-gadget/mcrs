@@ -181,16 +181,38 @@ where
             }
         } else {
             wait_for_prg_button_press(&mut button).await;
-            if display.wake().is_ok() && write_display_status(display, context, None).await.is_ok()
-            {
+            // Start tracking the release before restoring the OLED rail. A
+            // short press can otherwise finish during the display's 110 ms
+            // power-on/reset sequence and be misclassified as a long hold.
+            let (wake_result, action) = {
+                let mut action = pin!(wait_for_prg_button_release_or_hold(
+                    &mut button_delay,
+                    &mut button
+                ));
+                let mut wake_display = pin!(display.wake(&mut display_delay));
+                let mut completed_action = None;
+                let wake_result = poll_fn(|cx| {
+                    if completed_action.is_none()
+                        && let Poll::Ready(action) = action.as_mut().poll(cx)
+                    {
+                        completed_action = Some(action);
+                    }
+                    wake_display.as_mut().poll(cx)
+                })
+                .await;
+                let action = match completed_action {
+                    Some(action) => action,
+                    None => action.as_mut().await,
+                };
+                (wake_result, action)
+            };
+
+            if wake_result.is_ok() && write_display_status(display, context, None).await.is_ok() {
                 crate::platform::log_fmt(format_args!("OLED display woken by PRG button"));
                 awake = true;
-                let action =
-                    wait_for_prg_button_release_or_hold(&mut button_delay, &mut button).await;
                 show_prg_advert_message_if_sent(display, context, action).await;
             } else {
                 crate::platform::log_display_write_failed();
-                let _ = wait_for_prg_button_release_or_hold(&mut button_delay, &mut button).await;
             }
         }
     }
@@ -415,10 +437,18 @@ where
 }
 
 async fn wifi_task(
-    wifi: WifiResources,
+    mut wifi: WifiResources,
     context: &crate::app::AppContext<crate::platform::EspStorage>,
 ) -> ! {
-    let init = match esp_wifi::init(wifi.timer, wifi.rng) {
+    if context
+        .with_config(|config| config.wifi().ssid().is_empty())
+        .await
+    {
+        run_ota_ap_mode(&mut wifi, context).await
+    }
+
+    let WifiResources { timer, rng, wifi } = wifi;
+    let init = match esp_wifi::init(timer, rng) {
         Ok(init) => init,
         Err(error) => {
             crate::platform::log_fmt(format_args!("Wi-Fi: init failed: {:?}", error));
@@ -426,7 +456,7 @@ async fn wifi_task(
             unreachable!()
         }
     };
-    let (controller, interfaces) = match esp_wifi::wifi::new(&init, wifi.wifi) {
+    let (controller, interfaces) = match esp_wifi::wifi::new(&init, wifi) {
         Ok(wifi) => wifi,
         Err(error) => {
             crate::platform::log_fmt(format_args!("Wi-Fi: device init failed: {:?}", error));
@@ -434,23 +464,59 @@ async fn wifi_task(
             unreachable!()
         }
     };
-    if context
-        .with_config(|config| config.wifi().ssid().is_empty())
-        .await
-    {
-        run_ota_ap_mode(controller, interfaces.ap, context).await
-    } else {
-        run_ota_station_mode(controller, interfaces.sta, context).await
+    run_ota_station_mode(controller, interfaces.sta, context).await
+}
+
+async fn run_ota_ap_mode(
+    wifi: &mut WifiResources,
+    context: &crate::app::AppContext<crate::platform::EspStorage>,
+) -> ! {
+    // EspWifiController's Drop currently corrupts the esp-wifi 0.15.1 Xtensa
+    // scheduler task list after Wi-Fi has been used. Keep that small runtime
+    // alive after its first initialization; each session still gets its own
+    // WifiController, whose Drop fully deinitializes the Wi-Fi driver/radio.
+    let init = loop {
+        wait_for_ota_requested_idle(context, true).await;
+        match esp_wifi::init(wifi.timer.reborrow(), wifi.rng) {
+            Ok(init) => break init,
+            Err(error) => {
+                crate::platform::log_fmt(format_args!("Wi-Fi: init failed: {:?}", error));
+                context.request_ota_stop();
+            }
+        }
+    };
+    let mut stack_resources = embassy_net::StackResources::<4>::new();
+    loop {
+        wait_for_ota_requested_idle(context, true).await;
+
+        {
+            let (controller, interfaces) = match esp_wifi::wifi::new(&init, wifi.wifi.reborrow()) {
+                Ok(wifi) => wifi,
+                Err(error) => {
+                    crate::platform::log_fmt(format_args!(
+                        "Wi-Fi: device init failed: {:?}",
+                        error
+                    ));
+                    context.request_ota_stop();
+                    continue;
+                }
+            };
+
+            run_ota_ap_session(controller, interfaces.ap, &mut stack_resources, context).await;
+            // WifiDevice/Runner and WifiController are dropped here. The latter
+            // runs esp_wifi_stop(), esp_wifi_deinit_internal(), and
+            // esp_supplicant_deinit().
+        }
+        crate::platform::log_fmt(format_args!("OTA: Wi-Fi adapter shut down"));
     }
 }
 
-async fn run_ota_ap_mode<'a>(
+async fn run_ota_ap_session<'a>(
     mut controller: esp_wifi::wifi::WifiController<'a>,
     device: esp_wifi::wifi::WifiDevice<'a>,
+    stack_resources: &mut embassy_net::StackResources<4>,
     context: &crate::app::AppContext<crate::platform::EspStorage>,
-) -> ! {
-    static STACK_RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();
-    let stack_resources = STACK_RESOURCES.init(embassy_net::StackResources::new());
+) {
     let net_config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
         address: embassy_net::Ipv4Cidr::new(OTA_AP_IP, OTA_AP_PREFIX),
         gateway: None,
@@ -476,35 +542,33 @@ async fn run_ota_ap_mode<'a>(
     );
     if dhcp_socket.bind(OTA_DHCP_SERVER_PORT).is_err() {
         crate::platform::log_fmt(format_args!("OTA: DHCP bind failed"));
-        core::future::pending::<()>().await;
+        context.request_ota_stop();
+        return;
     }
     let mut dhcp = pin!(dhcp_server(&dhcp_socket));
     let ssid = ota_ssid(context).await;
-    let mut worker = pin!(async {
-        loop {
-            wait_for_ota_requested_idle(context, true).await;
-            if start_ota_ap(&mut controller, &ssid).await.is_err() {
-                context.request_ota_stop();
-                continue;
-            }
-            crate::platform::log_fmt(format_args!(
-                "OTA: AP started ssid={} url=http://{}/",
-                ssid, OTA_AP_IP
-            ));
-            serve_ota_session(stack, context).await;
-            let _ = stop_ota_ap(&mut controller).await;
-        }
-    });
-    let never: core::convert::Infallible = poll_fn(|cx| {
+    if let Err(error) = start_ota_ap(&mut controller, &ssid).await {
+        crate::platform::log_fmt(format_args!("OTA: AP start failed: {:?}", error));
+        context.request_ota_stop();
+        return;
+    }
+    crate::platform::log_fmt(format_args!(
+        "OTA: AP started ssid={} url=http://{}/",
+        ssid, OTA_AP_IP
+    ));
+    let mut session = pin!(serve_ota_session(stack, context));
+    poll_fn(|cx| {
         let _ = runner.as_mut().poll(cx);
         let _ = dhcp.as_mut().poll(cx);
-        match worker.as_mut().poll(cx) {
-            Poll::Ready(never) => match never {},
+        match session.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
         }
     })
     .await;
-    match never {}
+    if let Err(error) = stop_ota_ap(&mut controller).await {
+        crate::platform::log_fmt(format_args!("OTA: AP stop failed: {:?}", error));
+    }
 }
 
 async fn run_ota_station_mode<'a>(

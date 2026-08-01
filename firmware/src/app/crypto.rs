@@ -7,8 +7,9 @@ use aes::{
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
 use mcrs_protocol::{
-    AnonymousRequestPayload, DirectEncryptedPayload, PERM_ACL_ADMIN, Packet, Path, Payload,
-    RepeaterLoginResponsePlaintext, RoutePath, RouteType, TextMessagePlaintext, TextType,
+    AnonymousRequestPayload, DirectEncryptedPayload, PERM_ACL_ADMIN, Packet, Path, PathPlaintext,
+    Payload, PayloadKind, RepeaterLoginResponsePlaintext, RoutePath, RouteType,
+    TextMessagePlaintext, TextType,
 };
 use sha2::Sha256;
 
@@ -26,6 +27,7 @@ pub struct AuthenticatedPlaintext {
     pub sender_pubkey: [u8; 32],
     pub shared_secret: [u8; 32],
     pub privilege: super::remote::RemotePrivilege,
+    pub reply_path: Path,
     pub plaintext: Vec<u8>,
 }
 
@@ -71,7 +73,7 @@ pub fn decrypt_authenticated_direct_payload(
     if payload.destination_hash != identity.public_key()[0] {
         return None;
     }
-    if payload.ciphertext.is_empty() || !payload.ciphertext.len().is_multiple_of(16) {
+    if !payload.has_complete_ciphertext_blocks() {
         return None;
     }
 
@@ -88,6 +90,7 @@ pub fn decrypt_authenticated_direct_payload(
             sender_pubkey: session.public_key,
             shared_secret: session.shared_secret,
             privilege: session.privilege,
+            reply_path: session.reply_path.clone(),
             plaintext,
         });
     }
@@ -95,11 +98,12 @@ pub fn decrypt_authenticated_direct_payload(
     None
 }
 
-pub fn encode_zero_hop_login_response(
+pub fn encode_login_response(
     shared_secret: &[u8; 32],
     requester_public_key: &[u8; 32],
     responder_public_key: &[u8; 32],
     acl_permissions: u8,
+    reply_path: Path,
 ) -> Option<Vec<u8>> {
     let response = RepeaterLoginResponsePlaintext {
         server_timestamp: crate::platform::now_seconds(),
@@ -110,20 +114,22 @@ pub fn encode_zero_hop_login_response(
         firmware_version_level: 2,
     };
 
-    encode_zero_hop_response_plaintext(
+    encode_response_plaintext(
         shared_secret,
         requester_public_key,
         responder_public_key,
         &response.encode(),
+        reply_path,
     )
 }
 
-pub fn encode_zero_hop_cli_text_response(
+pub fn encode_cli_text_response(
     shared_secret: &[u8; 32],
     requester_public_key: &[u8; 32],
     responder_public_key: &[u8; 32],
     request_timestamp: u32,
     message: &[u8],
+    reply_path: Path,
 ) -> Option<Vec<u8>> {
     let mut timestamp = crate::platform::now_seconds();
     if timestamp == request_timestamp {
@@ -135,30 +141,65 @@ pub fn encode_zero_hop_cli_text_response(
         text_type: TextType::CliData,
         attempt: 0,
         message: message.to_vec(),
-    };
+    }
+    .encode()
+    .ok()?;
 
-    encode_zero_hop_direct_payload(
+    encode_direct_payload(
         PayloadKindForEncoding::TextMessage,
         shared_secret,
         requester_public_key,
         responder_public_key,
-        &plaintext.encode(),
+        &plaintext,
+        reply_path,
     )
 }
 
-pub fn encode_zero_hop_response_plaintext(
+pub fn encode_response_plaintext(
     shared_secret: &[u8; 32],
     requester_public_key: &[u8; 32],
     responder_public_key: &[u8; 32],
     plaintext: &[u8],
+    reply_path: Path,
 ) -> Option<Vec<u8>> {
-    encode_zero_hop_direct_payload(
+    encode_direct_payload(
         PayloadKindForEncoding::Response,
         shared_secret,
         requester_public_key,
         responder_public_key,
         plaintext,
+        reply_path,
     )
+}
+
+pub fn encode_path_response_packet(
+    shared_secret: &[u8; 32],
+    requester_public_key: &[u8; 32],
+    responder_public_key: &[u8; 32],
+    plaintext: &[u8],
+    discovered_path: Path,
+) -> Option<Packet> {
+    let outer_path = Path::new(discovered_path.hash_size(), Vec::new()).ok()?;
+    let path_plaintext = PathPlaintext {
+        path: discovered_path,
+        extra_type: Some(PayloadKind::Response),
+        extra_payload: plaintext.to_vec(),
+    }
+    .encode()
+    .ok()?;
+    let (mac, ciphertext) = encrypt_payload(shared_secret, &path_plaintext)?;
+
+    Some(Packet {
+        route_type: RouteType::Flood,
+        transport_codes: None,
+        path: RoutePath::Normal(outer_path),
+        payload: Payload::Path(DirectEncryptedPayload {
+            destination_hash: requester_public_key[0],
+            source_hash: responder_public_key[0],
+            mac,
+            ciphertext,
+        }),
+    })
 }
 
 enum PayloadKindForEncoding {
@@ -166,12 +207,13 @@ enum PayloadKindForEncoding {
     TextMessage,
 }
 
-fn encode_zero_hop_direct_payload(
+fn encode_direct_payload(
     kind: PayloadKindForEncoding,
     shared_secret: &[u8; 32],
     requester_public_key: &[u8; 32],
     responder_public_key: &[u8; 32],
     plaintext: &[u8],
+    reply_path: Path,
 ) -> Option<Vec<u8>> {
     let (mac, ciphertext) = encrypt_payload(shared_secret, plaintext)?;
     let payload = DirectEncryptedPayload {
@@ -184,7 +226,7 @@ fn encode_zero_hop_direct_payload(
     Packet {
         route_type: RouteType::Direct,
         transport_codes: None,
-        path: RoutePath::Normal(Path::empty()),
+        path: RoutePath::Normal(reply_path),
         payload: match kind {
             PayloadKindForEncoding::Response => Payload::Response(payload),
             PayloadKindForEncoding::TextMessage => Payload::TextMessage(payload),
@@ -255,4 +297,69 @@ fn mac_for_ciphertext(shared_secret: &[u8; 32], ciphertext: &[u8]) -> Option<[u8
     mac.update(ciphertext);
     let digest = mac.finalize().into_bytes();
     Some([digest[0], digest[1]])
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn authenticated_direct_decrypt_rejects_unaligned_ciphertext_before_aes() {
+        let identity = Identity::from_private_key_seed(&[1; 32]);
+        let payload = DirectEncryptedPayload {
+            destination_hash: identity.public_key()[0],
+            source_hash: 0,
+            mac: [0; 2],
+            ciphertext: vec![0],
+        };
+
+        assert!(decrypt_authenticated_direct_payload(&payload, &identity, &[]).is_none());
+    }
+
+    #[test]
+    fn anonymous_decrypt_rejects_unaligned_ciphertext_before_aes() {
+        let identity = Identity::from_private_key_seed(&[1; 32]);
+        let payload = AnonymousRequestPayload {
+            destination_hash: identity.public_key()[0],
+            sender_pubkey: [2; 32],
+            mac: [0; 2],
+            ciphertext: vec![0],
+        };
+
+        assert!(decrypt_anonymous_request(&payload, &identity).is_none());
+    }
+
+    #[test]
+    fn path_response_wraps_response_and_preserves_discovered_path() {
+        let shared_secret = [7; 32];
+        let requester = [8; 32];
+        let responder = [9; 32];
+        let discovered_path =
+            Path::new(mcrs_protocol::HashSize::Two, vec![0x11, 0x22, 0x33, 0x44]).unwrap();
+        let packet = encode_path_response_packet(
+            &shared_secret,
+            &requester,
+            &responder,
+            b"reply",
+            discovered_path.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(packet.route_type, RouteType::Flood);
+        assert_eq!(
+            packet.normal_path().unwrap().hash_size(),
+            mcrs_protocol::HashSize::Two
+        );
+        assert_eq!(packet.normal_path().unwrap().hop_count(), 0);
+        let Payload::Path(payload) = packet.payload else {
+            panic!("expected PATH payload");
+        };
+        let decrypted = decrypt_payload(&shared_secret, &payload.ciphertext).unwrap();
+        let wrapped = PathPlaintext::decode(&decrypted).unwrap();
+        assert_eq!(wrapped.path, discovered_path);
+        assert_eq!(wrapped.extra_type, Some(PayloadKind::Response));
+        assert_eq!(wrapped.extra_payload, b"reply");
+    }
 }

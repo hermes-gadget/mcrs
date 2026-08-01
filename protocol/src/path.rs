@@ -23,7 +23,18 @@ impl Path {
     }
 
     pub fn from_hashes(hash_size: HashSize, hashes: &[&[u8]]) -> Result<Self> {
-        let mut bytes = Vec::with_capacity(hash_size.size() * hashes.len());
+        if hashes.len() > 63 {
+            return Err(Error::InvalidPathLength);
+        }
+        let len = hash_size
+            .size()
+            .checked_mul(hashes.len())
+            .ok_or(Error::InvalidPathLength)?;
+        if len > MAX_PATH_SIZE {
+            return Err(Error::PathTooLong { len });
+        }
+
+        let mut bytes = Vec::with_capacity(len);
         for hash in hashes {
             if hash.len() != hash_size.size() {
                 return Err(Error::InvalidLength("path hash"));
@@ -47,6 +58,17 @@ impl Path {
 
     pub fn hashes(&self) -> impl Iterator<Item = &[u8]> {
         self.bytes.chunks_exact(self.hash_size.size())
+    }
+
+    pub fn reversed(&self) -> Self {
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        for hash in self.bytes.chunks_exact(self.hash_size.size()).rev() {
+            bytes.extend_from_slice(hash);
+        }
+        Self {
+            hash_size: self.hash_size,
+            bytes,
+        }
     }
 
     pub fn first_hash(&self) -> Option<&[u8]> {

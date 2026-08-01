@@ -12,7 +12,7 @@ pub mod regions;
 mod remote;
 pub mod telnet;
 
-use alloc::{collections::VecDeque, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::{
     cell::{Cell, RefCell},
     fmt,
@@ -21,7 +21,12 @@ use core::{
     sync::atomic::{AtomicI16, AtomicU8, AtomicU16, AtomicU32, Ordering},
     task::{Poll, Waker},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex};
+use embassy_sync::{
+    blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex},
+    channel::Channel,
+    mutex::Mutex,
+    signal::Signal,
+};
 use embedded_hal_async::delay::DelayNs;
 use mcrs_protocol::{Packet, PayloadKind, RoutePath, RouteType, SeenPacketCache};
 
@@ -37,8 +42,6 @@ const CAD_BUSY_BACKOFF_BASE_MS: u32 = 10;
 const CAD_BUSY_BACKOFF_AIRTIME_DIVISOR: u32 = 2;
 const CAD_BUSY_BACKOFF_SYMBOLS: u32 = 4;
 const DUTY_CYCLE_WINDOW_MS: u64 = 3_600_000;
-const MIN_TX_BUDGET_RESERVE_MS: u64 = 100;
-const MIN_TX_BUDGET_AIRTIME_DIVISOR: u64 = 2;
 const BATTERY_LEVEL_UNKNOWN: u8 = u8::MAX;
 const BATTERY_MILLIVOLTS_UNKNOWN: u16 = u16::MAX;
 
@@ -54,12 +57,13 @@ where
     neighbours: AppMutex<neighbours::NeighbourTable>,
     remote_logins: AppMutex<remote::RemoteLoginTable>,
     inbound: Channel<CriticalSectionRawMutex, RxEvent, INBOUND_QUEUE_CAPACITY>,
-    outbound: Channel<CriticalSectionRawMutex, QueuedTransmit, OUTBOUND_QUEUE_CAPACITY>,
+    outbound: SortedOutboundChannel,
     ota_requested: Cell<bool>,
     ota_waker: RefCell<Option<Waker>>,
     ota_generation: Cell<u32>,
     reboot_after_next_remote_reply: Cell<bool>,
     seen_packets: RefCell<SeenPacketCache>,
+    pending_forwards: RefCell<Vec<[u8; 8]>>,
     pending_discover: RefCell<Option<PendingDiscover>>,
     started_at_ms: u64,
     packets_received: AtomicU32,
@@ -88,7 +92,7 @@ where
             neighbours: Mutex::new(neighbours::NeighbourTable::new(memory.max_neighbours)),
             remote_logins: Mutex::new(remote::RemoteLoginTable::new()),
             inbound: Channel::new(),
-            outbound: Channel::new(),
+            outbound: SortedOutboundChannel::new(memory.outbound_queue_len),
             ota_requested: Cell::new(false),
             ota_waker: RefCell::new(None),
             ota_generation: Cell::new(0),
@@ -96,6 +100,9 @@ where
             seen_packets: RefCell::new(SeenPacketCache::new_with_capacity(
                 SEEN_PACKET_TTL_MS,
                 memory.seen_packet_cache_len,
+            )),
+            pending_forwards: RefCell::new(Vec::with_capacity(
+                memory.outbound_queue_len.min(OUTBOUND_QUEUE_CAPACITY),
             )),
             pending_discover: RefCell::new(None),
             started_at_ms: crate::platform::now_millis(),
@@ -197,6 +204,7 @@ where
         privilege: remote::RemotePrivilege,
         last_timestamp: u32,
         now_ms: u64,
+        reply_path: &mcrs_protocol::Path,
     ) {
         self.remote_logins.lock().await.authenticate(
             public_key,
@@ -204,6 +212,7 @@ where
             privilege,
             last_timestamp,
             now_ms,
+            reply_path,
         );
     }
 
@@ -381,26 +390,39 @@ where
         delay_ms: u32,
         reboot_after_tx: bool,
     ) -> Result<(), OutboundError> {
-        if self.outbound.len() >= self.memory.outbound_queue_len {
-            return Err(OutboundError::QueueFull);
+        self.enqueue_outbound_item(packet, delay_ms, reboot_after_tx, None)
+    }
+
+    fn enqueue_forward(
+        &self,
+        packet: Vec<u8>,
+        delay_ms: u32,
+        signature: [u8; 8],
+    ) -> Result<bool, OutboundError> {
+        if !self.reserve_forward(signature)? {
+            return Ok(false);
         }
+        if let Err(error) = self.enqueue_outbound_item(packet, delay_ms, false, Some(signature)) {
+            self.release_forward(signature, false);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    fn enqueue_outbound_item(
+        &self,
+        packet: Vec<u8>,
+        delay_ms: u32,
+        reboot_after_tx: bool,
+        dedup_signature: Option<[u8; 8]>,
+    ) -> Result<(), OutboundError> {
         let queued = QueuedTransmit {
             eligible_at_ms: crate::platform::now_millis().saturating_add(delay_ms as u64),
             packet,
+            dedup_signature,
             reboot_after_tx,
         };
-        self.outbound
-            .try_send(queued)
-            .map_err(|_| OutboundError::QueueFull)?;
-        Ok(())
-    }
-
-    fn try_receive_outbound(&self) -> Option<QueuedTransmit> {
-        self.outbound.try_receive().ok()
-    }
-
-    async fn receive_outbound(&self) -> QueuedTransmit {
-        self.outbound.receive().await
+        self.outbound.try_send(queued)
     }
 
     pub fn request_reboot_after_next_remote_reply(&self) {
@@ -443,10 +465,47 @@ where
         reboot
     }
 
-    fn mark_seen(&self, signature: [u8; 8]) -> bool {
+    fn is_seen_or_pending(&self, signature: [u8; 8]) -> bool {
+        if self.pending_forwards.borrow().contains(&signature) {
+            return true;
+        }
         self.seen_packets
             .borrow_mut()
-            .check_and_insert(signature, crate::platform::now_millis())
+            .contains(signature, crate::platform::now_millis())
+    }
+
+    fn reserve_forward(&self, signature: [u8; 8]) -> Result<bool, OutboundError> {
+        if self.is_seen_or_pending(signature) {
+            return Ok(false);
+        }
+        let mut pending = self.pending_forwards.borrow_mut();
+        if pending.len() >= self.memory.outbound_queue_len.min(OUTBOUND_QUEUE_CAPACITY) {
+            return Err(OutboundError::QueueFull);
+        }
+        pending.push(signature);
+        Ok(true)
+    }
+
+    fn release_forward(&self, signature: [u8; 8], transmitted: bool) {
+        let index = self
+            .pending_forwards
+            .borrow()
+            .iter()
+            .position(|pending| *pending == signature);
+        if let Some(index) = index {
+            self.pending_forwards.borrow_mut().remove(index);
+        }
+        if transmitted {
+            self.seen_packets
+                .borrow_mut()
+                .touch(signature, crate::platform::now_millis());
+        }
+    }
+
+    fn finish_forward(&self, signature: Option<[u8; 8]>, transmitted: bool) {
+        if let Some(signature) = signature {
+            self.release_forward(signature, transmitted);
+        }
     }
 
     pub fn start_discover_neighbours(&self, tag: u32, now_ms: u64) {
@@ -537,55 +596,141 @@ struct PendingDiscover {
 struct QueuedTransmit {
     eligible_at_ms: u64,
     packet: Vec<u8>,
+    dedup_signature: Option<[u8; 8]>,
     reboot_after_tx: bool,
 }
 
-struct OutboundSchedule {
-    pending: VecDeque<QueuedTransmit>,
+#[derive(Clone, Copy)]
+struct NextOutbound {
+    eligible_at_ms: u64,
+    packet_len: usize,
+}
+
+struct SortedOutboundChannel {
+    queue: BlockingMutex<CriticalSectionRawMutex, RefCell<Vec<QueuedTransmit>>>,
+    changed: Signal<CriticalSectionRawMutex, ()>,
+    capacity: usize,
+    active: AtomicU8,
+}
+
+impl SortedOutboundChannel {
+    fn new(configured_capacity: usize) -> Self {
+        let capacity = configured_capacity.min(OUTBOUND_QUEUE_CAPACITY);
+        Self {
+            queue: BlockingMutex::new(RefCell::new(Vec::with_capacity(capacity))),
+            changed: Signal::new(),
+            capacity,
+            active: AtomicU8::new(0),
+        }
+    }
+
+    fn try_send(&self, queued: QueuedTransmit) -> Result<(), OutboundError> {
+        self.queue.lock(|queue| {
+            let mut queue = queue.borrow_mut();
+            let total = queue
+                .len()
+                .saturating_add(self.active.load(Ordering::Relaxed) as usize);
+            if total >= self.capacity {
+                return Err(OutboundError::QueueFull);
+            }
+            let index = queue
+                .iter()
+                .position(|pending| queued.eligible_at_ms < pending.eligible_at_ms)
+                .unwrap_or(queue.len());
+            queue.insert(index, queued);
+            Ok(())
+        })?;
+        self.changed.signal(());
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.queue.lock(|queue| {
+            queue
+                .borrow()
+                .len()
+                .saturating_add(self.active.load(Ordering::Relaxed) as usize)
+        })
+    }
+
+    fn next(&self) -> Option<NextOutbound> {
+        self.queue.lock(|queue| {
+            queue.borrow().first().map(|queued| NextOutbound {
+                eligible_at_ms: queued.eligible_at_ms,
+                packet_len: queued.packet.len(),
+            })
+        })
+    }
+
+    fn next_after_reset(&self) -> Option<NextOutbound> {
+        self.changed.reset();
+        self.next()
+    }
+
+    fn take_first(&self) -> Option<QueuedTransmit> {
+        self.queue.lock(|queue| {
+            let mut queue = queue.borrow_mut();
+            if queue.is_empty() {
+                None
+            } else {
+                self.active.store(1, Ordering::Relaxed);
+                Some(queue.remove(0))
+            }
+        })
+    }
+
+    fn complete_current(&self) {
+        let previous = self.active.swap(0, Ordering::Relaxed);
+        debug_assert_eq!(previous, 1, "completed without an active outbound packet");
+    }
+
+    fn wait_changed(&self) -> impl Future<Output = ()> + '_ {
+        self.changed.wait()
+    }
 }
 
 struct AirtimeBudget {
-    available_ms: u64,
+    available_ms: i64,
     last_update_ms: u64,
 }
 
 impl AirtimeBudget {
     fn new(now_ms: u64, duty_cycle_percent: u8) -> Self {
         Self {
-            available_ms: duty_cycle_max_budget_ms(duty_cycle_percent),
+            available_ms: duty_cycle_max_budget_ms(duty_cycle_percent) as i64,
             last_update_ms: now_ms,
         }
     }
 
     fn update(&mut self, now_ms: u64, duty_cycle_percent: u8) {
         if duty_cycle_percent >= 100 {
-            self.available_ms = DUTY_CYCLE_WINDOW_MS;
+            self.available_ms = DUTY_CYCLE_WINDOW_MS as i64;
             self.last_update_ms = now_ms;
             return;
         }
-        self.available_ms = self
-            .available_ms
-            .min(duty_cycle_max_budget_ms(duty_cycle_percent));
+        let max_budget_ms = duty_cycle_max_budget_ms(duty_cycle_percent) as i64;
+        self.available_ms = self.available_ms.min(max_budget_ms);
         let elapsed_ms = now_ms.saturating_sub(self.last_update_ms);
         let refill_ms = elapsed_ms.saturating_mul(duty_cycle_percent.clamp(1, 100) as u64) / 100;
         if refill_ms > 0 {
             self.available_ms = self
                 .available_ms
-                .saturating_add(refill_ms)
-                .min(duty_cycle_max_budget_ms(duty_cycle_percent));
+                .saturating_add(refill_ms.min(i64::MAX as u64) as i64)
+                .min(max_budget_ms);
             self.last_update_ms = now_ms;
         }
     }
 
-    fn ready_at_ms(&mut self, now_ms: u64, required_ms: u64, duty_cycle_percent: u8) -> u64 {
+    fn ready_at_ms(&mut self, now_ms: u64, required_ms: u32, duty_cycle_percent: u8) -> u64 {
         if duty_cycle_percent >= 100 {
             return now_ms;
         }
         self.update(now_ms, duty_cycle_percent);
+        let required_ms = i64::from(required_ms);
         if self.available_ms >= required_ms {
             now_ms
         } else {
-            let needed_ms = required_ms - self.available_ms;
+            let needed_ms = required_ms.saturating_sub(self.available_ms) as u64;
             now_ms.saturating_add(div_ceil_u64(
                 needed_ms.saturating_mul(100),
                 duty_cycle_percent.clamp(1, 100) as u64,
@@ -598,46 +743,12 @@ impl AirtimeBudget {
             return;
         }
         self.update(now_ms, duty_cycle_percent);
-        self.available_ms = self.available_ms.saturating_sub(airtime_ms as u64);
+        self.available_ms = self.available_ms.saturating_sub(i64::from(airtime_ms));
     }
 }
 
 fn duty_cycle_max_budget_ms(duty_cycle_percent: u8) -> u64 {
     DUTY_CYCLE_WINDOW_MS * duty_cycle_percent.clamp(1, 100) as u64 / 100
-}
-
-impl OutboundSchedule {
-    fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-        }
-    }
-
-    fn push(&mut self, queued: QueuedTransmit) {
-        let index = self
-            .pending
-            .iter()
-            .position(|pending| queued.eligible_at_ms < pending.eligible_at_ms)
-            .unwrap_or(self.pending.len());
-        self.pending.insert(index, queued);
-    }
-
-    fn pop_eligible(&mut self, now_ms: u64) -> Option<QueuedTransmit> {
-        match self.pending.front() {
-            Some(queued) if queued.eligible_at_ms <= now_ms => self.pending.pop_front(),
-            _ => None,
-        }
-    }
-
-    fn has_eligible(&self, now_ms: u64) -> bool {
-        self.pending
-            .front()
-            .is_some_and(|queued| queued.eligible_at_ms <= now_ms)
-    }
-
-    fn next_eligible_ms(&self) -> Option<u64> {
-        self.pending.front().map(|queued| queued.eligible_at_ms)
-    }
 }
 
 struct RxEvent {
@@ -649,7 +760,7 @@ struct RxEvent {
 
 enum RadioWait {
     Packet(Result<crate::modules::ReceivedPacket, ()>),
-    NewOutbound(QueuedTransmit),
+    OutboundChanged,
     OutboundDue,
 }
 
@@ -660,31 +771,25 @@ where
     D: DelayNs,
 {
     let mut receive_buffer = [0u8; RECEIVE_BUFFER_LEN];
-    let mut outbound = OutboundSchedule::new();
     let duty_cycle_percent = context
         .with_config(|config| config.duty_cycle_percent())
         .await;
     let mut airtime_budget = AirtimeBudget::new(crate::platform::now_millis(), duty_cycle_percent);
 
     loop {
-        drain_outbound_channel(context, &mut outbound);
-        drain_eligible_outbound(radio, context, delay, &mut outbound, &mut airtime_budget).await;
+        transmit_eligible_outbound(radio, context, delay, &mut airtime_budget).await;
 
         match wait_for_read_or_eligible_outbound(
             radio,
             context,
             &mut receive_buffer,
             delay,
-            &outbound,
             &mut airtime_budget,
         )
         .await
         {
             RadioWait::OutboundDue => continue,
-            RadioWait::NewOutbound(queued) => {
-                outbound.push(queued);
-                continue;
-            }
+            RadioWait::OutboundChanged => continue,
             RadioWait::Packet(Ok(packet)) => {
                 context.record_packet_received(packet.rssi, packet.snr);
                 if packet.len > receive_buffer.len() {
@@ -790,113 +895,94 @@ where
     }
 }
 
-fn drain_outbound_channel<S>(context: &AppContext<S>, outbound: &mut OutboundSchedule)
-where
-    S: crate::platform::storage::Storage,
-{
-    while let Some(queued) = context.try_receive_outbound() {
-        outbound.push(queued);
-    }
-}
-
-async fn drain_eligible_outbound<R, S, D>(
+async fn transmit_eligible_outbound<R, S, D>(
     radio: &mut R,
     context: &AppContext<S>,
     delay: &mut D,
-    outbound: &mut OutboundSchedule,
     airtime_budget: &mut AirtimeBudget,
 ) where
     R: crate::modules::Receiver,
     S: crate::platform::storage::Storage,
     D: DelayNs,
 {
-    loop {
-        let (radio_config, duty_cycle_percent) = context
-            .with_config(|config| (config.radio(), config.duty_cycle_percent()))
-            .await;
-        let now_ms = crate::platform::now_millis();
-        let required_ms = if duty_cycle_percent >= 100 {
-            0
-        } else {
-            minimum_tx_budget_ms(radio_config)
-        };
-        if airtime_budget.ready_at_ms(now_ms, required_ms, duty_cycle_percent) > now_ms {
-            return;
-        }
-        let Some(queued) = outbound.pop_eligible(crate::platform::now_millis()) else {
-            return;
-        };
-        mark_outbound_seen(context, &queued.packet);
-        let region = context.outbound_region_label(&queued.packet).await;
-        if transmit_when_clear(radio, &queued.packet, radio_config, delay)
-            .await
-            .is_err()
-        {
-            context.record_packet_error();
-            crate::platform::log_fmt(format_args!("Outbound packet: transmit failed"));
-            return;
-        }
-        context.record_packet_sent();
-        let airtime_ms = radio_config.packet_airtime_ms(queued.packet.len());
-        context.record_tx_airtime(airtime_ms);
-        airtime_budget.record_transmit(
-            crate::platform::now_millis(),
-            airtime_ms,
-            duty_cycle_percent,
-        );
-        if duty_cycle_percent >= 100 {
-            match region {
-                Some(region) => crate::platform::log_fmt(format_args!(
-                    "Outbound packet: transmitted {} bytes region={} airtime={}ms dutycycle=100% budget=unlimited",
-                    queued.packet.len(),
-                    region,
-                    airtime_ms
-                )),
-                None => crate::platform::log_fmt(format_args!(
-                    "Outbound packet: transmitted {} bytes airtime={}ms dutycycle=100% budget=unlimited",
-                    queued.packet.len(),
-                    airtime_ms
-                )),
-            }
-        } else {
-            match region {
-                Some(region) => crate::platform::log_fmt(format_args!(
-                    "Outbound packet: transmitted {} bytes region={} airtime={}ms dutycycle={}% budget={}ms",
-                    queued.packet.len(),
-                    region,
-                    airtime_ms,
-                    duty_cycle_percent,
-                    airtime_budget.available_ms
-                )),
-                None => crate::platform::log_fmt(format_args!(
-                    "Outbound packet: transmitted {} bytes airtime={}ms dutycycle={}% budget={}ms",
-                    queued.packet.len(),
-                    airtime_ms,
-                    duty_cycle_percent,
-                    airtime_budget.available_ms
-                )),
-            }
-        }
-        if queued.reboot_after_tx {
-            crate::platform::reboot();
-        }
-    }
-}
-
-fn mark_outbound_seen<S>(context: &AppContext<S>, packet: &[u8])
-where
-    S: crate::platform::storage::Storage,
-{
-    let Ok(packet) = Packet::decode(packet) else {
+    let (radio_config, duty_cycle_percent) = context
+        .with_config(|config| (config.radio(), config.duty_cycle_percent()))
+        .await;
+    let now_ms = crate::platform::now_millis();
+    let Some(next) = context.outbound.next() else {
         return;
     };
-    if !packet.route_type.is_flood() {
+    if next.eligible_at_ms > now_ms {
         return;
     }
-    let Ok(signature) = packet.dedup_signature() else {
+    let required_ms = if duty_cycle_percent >= 100 {
+        0
+    } else {
+        radio_config.packet_airtime_ms(next.packet_len)
+    };
+    if airtime_budget.ready_at_ms(now_ms, required_ms, duty_cycle_percent) > now_ms {
+        return;
+    }
+    let Some(queued) = context.outbound.take_first() else {
         return;
     };
-    context.mark_seen(signature);
+    let region = context.outbound_region_label(&queued.packet).await;
+    if transmit_when_clear(radio, &queued.packet, radio_config, delay)
+        .await
+        .is_err()
+    {
+        context.finish_forward(queued.dedup_signature, false);
+        context.record_packet_error();
+        crate::platform::log_fmt(format_args!("Outbound packet: transmit failed"));
+        context.outbound.complete_current();
+        return;
+    }
+    context.finish_forward(queued.dedup_signature, true);
+    context.record_packet_sent();
+    let airtime_ms = radio_config.packet_airtime_ms(queued.packet.len());
+    context.record_tx_airtime(airtime_ms);
+    airtime_budget.record_transmit(
+        crate::platform::now_millis(),
+        airtime_ms,
+        duty_cycle_percent,
+    );
+    if duty_cycle_percent >= 100 {
+        match region {
+            Some(region) => crate::platform::log_fmt(format_args!(
+                "Outbound packet: transmitted {} bytes region={} airtime={}ms dutycycle=100% budget=unlimited",
+                queued.packet.len(),
+                region,
+                airtime_ms
+            )),
+            None => crate::platform::log_fmt(format_args!(
+                "Outbound packet: transmitted {} bytes airtime={}ms dutycycle=100% budget=unlimited",
+                queued.packet.len(),
+                airtime_ms
+            )),
+        }
+    } else {
+        match region {
+            Some(region) => crate::platform::log_fmt(format_args!(
+                "Outbound packet: transmitted {} bytes region={} airtime={}ms dutycycle={}% budget={}ms",
+                queued.packet.len(),
+                region,
+                airtime_ms,
+                duty_cycle_percent,
+                airtime_budget.available_ms
+            )),
+            None => crate::platform::log_fmt(format_args!(
+                "Outbound packet: transmitted {} bytes airtime={}ms dutycycle={}% budget={}ms",
+                queued.packet.len(),
+                airtime_ms,
+                duty_cycle_percent,
+                airtime_budget.available_ms
+            )),
+        }
+    }
+    context.outbound.complete_current();
+    if queued.reboot_after_tx {
+        crate::platform::reboot();
+    }
 }
 
 async fn wait_for_read_or_eligible_outbound<R, S, D>(
@@ -904,7 +990,6 @@ async fn wait_for_read_or_eligible_outbound<R, S, D>(
     context: &AppContext<S>,
     receive_buffer: &mut [u8],
     delay: &mut D,
-    outbound: &OutboundSchedule,
     airtime_budget: &mut AirtimeBudget,
 ) -> RadioWait
 where
@@ -916,29 +1001,27 @@ where
         .with_config(|config| (config.radio(), config.duty_cycle_percent()))
         .await;
     let now_ms = crate::platform::now_millis();
-    let budget_ready_ms = if duty_cycle_percent >= 100 {
-        now_ms
-    } else {
-        airtime_budget.ready_at_ms(
+    let next = context.outbound.next_after_reset();
+    let budget_ready_ms = match next {
+        Some(_) if duty_cycle_percent >= 100 => now_ms,
+        Some(queued) => airtime_budget.ready_at_ms(
             now_ms,
-            minimum_tx_budget_ms(radio_config),
+            radio_config.packet_airtime_ms(queued.packet_len),
             duty_cycle_percent,
-        )
+        ),
+        None => now_ms,
     };
-    if outbound.has_eligible(now_ms) && now_ms >= budget_ready_ms {
+    if next.is_some_and(|queued| queued.eligible_at_ms <= now_ms && now_ms >= budget_ready_ms) {
         return RadioWait::OutboundDue;
     }
 
     let mut receive = pin!(radio.wait_for_read(receive_buffer));
-    let mut new_outbound = pin!(context.receive_outbound());
+    let mut outbound_changed = pin!(context.outbound.wait_changed());
 
-    let Some(eligible_at_ms) = outbound
-        .next_eligible_ms()
-        .map(|eligible_at_ms| eligible_at_ms.max(budget_ready_ms))
-    else {
+    let Some(eligible_at_ms) = next.map(|queued| queued.eligible_at_ms.max(budget_ready_ms)) else {
         return poll_fn(|cx| {
-            if let Poll::Ready(queued) = new_outbound.as_mut().poll(cx) {
-                return Poll::Ready(RadioWait::NewOutbound(queued));
+            if outbound_changed.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(RadioWait::OutboundChanged);
             }
 
             match receive.as_mut().poll(cx) {
@@ -954,19 +1037,15 @@ where
         .min(u32::MAX as u64) as u32;
     let mut timer = pin!(delay.delay_ms(wait_ms));
     poll_fn(|cx| {
-        if let Poll::Ready(queued) = new_outbound.as_mut().poll(cx) {
-            return Poll::Ready(RadioWait::NewOutbound(queued));
+        if outbound_changed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(RadioWait::OutboundChanged);
         }
-
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(RadioWait::OutboundDue);
+        }
         match receive.as_mut().poll(cx) {
             Poll::Ready(result) => Poll::Ready(RadioWait::Packet(result)),
-            Poll::Pending => {
-                if timer.as_mut().poll(cx).is_ready() {
-                    Poll::Ready(RadioWait::OutboundDue)
-                } else {
-                    Poll::Pending
-                }
-            }
+            Poll::Pending => Poll::Pending,
         }
     })
     .await
@@ -1018,9 +1097,16 @@ async fn queue_repeater_packet<S>(
     }
 
     let encoded_len = encoded.len();
-    if context.enqueue_outbound_after(encoded, delay_ms).is_err() {
-        crate::platform::log_fmt(format_args!("Protocol repeater: outbound queue full"));
-        return;
+    match context.enqueue_forward(encoded, delay_ms, signature) {
+        Ok(true) => {}
+        Ok(false) => {
+            crate::platform::log_fmt(format_args!("Protocol repeater: drop: duplicate"));
+            return;
+        }
+        Err(OutboundError::QueueFull) => {
+            crate::platform::log_fmt(format_args!("Protocol repeater: outbound queue full"));
+            return;
+        }
     }
 
     crate::platform::log_fmt(format_args!(
@@ -1042,21 +1128,12 @@ async fn prepare_forward(
         return ForwardDecision::Drop("unsupported payload kind");
     }
 
-    let signature = match packet.dedup_signature() {
-        Ok(signature) => signature,
-        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
-    };
-
     match packet.payload.kind() {
-        PayloadKind::Trace => {
-            prepare_trace_forward(context, packet, signature, snr_quarters, node_hash)
-        }
+        PayloadKind::Trace => prepare_trace_forward(packet, snr_quarters, node_hash),
         _ if packet.route_type.is_flood() => {
-            prepare_flood_forward(context, packet, signature, node_hash).await
+            prepare_flood_forward(context, packet, node_hash).await
         }
-        _ if packet.route_type.is_direct() => {
-            prepare_direct_forward(context, packet, signature, node_hash).await
-        }
+        _ if packet.route_type.is_direct() => prepare_direct_forward(packet, node_hash),
         _ => ForwardDecision::Drop("unknown route"),
     }
 }
@@ -1064,7 +1141,6 @@ async fn prepare_forward(
 async fn prepare_flood_forward(
     context: &AppContext<impl crate::platform::storage::Storage>,
     mut packet: Packet,
-    signature: [u8; 8],
     node_hash: &[u8],
 ) -> ForwardDecision {
     if !matches!(
@@ -1126,10 +1202,12 @@ async fn prepare_flood_forward(
         return ForwardDecision::DoNotForward;
     }
 
-    if !context.mark_seen(signature) {
-        return ForwardDecision::Drop("duplicate");
-    }
-
+    // Capture changes the flood routing namespace. Derive the signature only after
+    // that transformation so scoped and unscoped copies deduplicate independently.
+    let signature = match packet.dedup_signature() {
+        Ok(signature) => signature,
+        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
+    };
     if packet.append_flood_hop(node_hash).is_err() {
         return ForwardDecision::DoNotForward;
     }
@@ -1141,12 +1219,7 @@ async fn prepare_flood_forward(
     }
 }
 
-async fn prepare_direct_forward(
-    context: &AppContext<impl crate::platform::storage::Storage>,
-    mut packet: Packet,
-    signature: [u8; 8],
-    node_hash: &[u8],
-) -> ForwardDecision {
+fn prepare_direct_forward(mut packet: Packet, node_hash: &[u8]) -> ForwardDecision {
     if !matches!(
         packet.route_type,
         RouteType::Direct | RouteType::TransportDirect
@@ -1161,22 +1234,19 @@ async fn prepare_direct_forward(
         return ForwardDecision::DoNotForward;
     }
 
+    let signature = match packet.dedup_signature() {
+        Ok(signature) => signature,
+        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
+    };
     match packet.consume_direct_hop(node_hash) {
-        Ok(true) => {
-            if !context.mark_seen(signature) {
-                return ForwardDecision::Drop("duplicate");
-            }
-            ForwardDecision::Forward { packet, signature }
-        }
+        Ok(true) => ForwardDecision::Forward { packet, signature },
         Ok(false) => ForwardDecision::DoNotForward,
         Err(_) => ForwardDecision::Drop("direct path mutation failed"),
     }
 }
 
 fn prepare_trace_forward(
-    context: &AppContext<impl crate::platform::storage::Storage>,
     mut packet: Packet,
-    signature: [u8; 8],
     snr_quarters: i16,
     node_hash: &[u8],
 ) -> ForwardDecision {
@@ -1197,10 +1267,10 @@ fn prepare_trace_forward(
         Err(_) => return ForwardDecision::Drop("trace next-hop check failed"),
     }
 
-    if !context.mark_seen(signature) {
-        return ForwardDecision::Drop("duplicate");
-    }
-
+    let signature = match packet.dedup_signature() {
+        Ok(signature) => signature,
+        Err(_) => return ForwardDecision::Drop("dedup signature failed"),
+    };
     if packet
         .append_trace_snr(snr_quarters.clamp(i8::MIN as i16, i8::MAX as i16) as i8)
         .is_err()
@@ -1271,12 +1341,6 @@ fn cad_busy_backoff_ms(payload: &[u8], radio_config: config::RadioConfig, attemp
         .saturating_add(seed % jitter_window_ms)
 }
 
-fn minimum_tx_budget_ms(radio_config: config::RadioConfig) -> u64 {
-    MIN_TX_BUDGET_RESERVE_MS.max(
-        radio_config.packet_airtime_ms(RECEIVE_BUFFER_LEN) as u64 / MIN_TX_BUDGET_AIRTIME_DIVISOR,
-    )
-}
-
 fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
     numerator / denominator + u64::from(!numerator.is_multiple_of(denominator))
 }
@@ -1286,4 +1350,38 @@ enum ForwardDecision {
     Capture { packet: Packet, signature: [u8; 8] },
     DoNotForward,
     Drop(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queued(eligible_at_ms: u64) -> QueuedTransmit {
+        QueuedTransmit {
+            eligible_at_ms,
+            packet: Vec::new(),
+            dedup_signature: None,
+            reboot_after_tx: false,
+        }
+    }
+
+    #[test]
+    fn sorted_outbound_channel_orders_and_bounds_all_retained_packets() {
+        let channel = SortedOutboundChannel::new(2);
+        assert!(channel.try_send(queued(200)).is_ok());
+        assert!(channel.try_send(queued(100)).is_ok());
+        assert_eq!(channel.len(), 2);
+        assert_eq!(channel.next().map(|next| next.eligible_at_ms), Some(100));
+        assert!(channel.try_send(queued(50)).is_err());
+
+        let current = channel.take_first().expect("earliest packet");
+        assert_eq!(current.eligible_at_ms, 100);
+        assert_eq!(channel.len(), 2);
+        assert!(channel.try_send(queued(50)).is_err());
+
+        channel.complete_current();
+        assert_eq!(channel.len(), 1);
+        assert!(channel.try_send(queued(50)).is_ok());
+        assert_eq!(channel.next().map(|next| next.eligible_at_ms), Some(50));
+    }
 }
